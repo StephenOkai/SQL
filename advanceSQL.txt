@@ -1,0 +1,236 @@
+-- month-over-month sales growth for each product.
+WITH monthly_sales AS (
+SELECT
+	productkey,
+	DATE_PART('year', CAST(CAST(salesorderdatekey AS CHAR(8)) AS DATE)) AS sales_year,
+	DATE_PART('month', CAST(CAST(salesorderdatekey AS CHAR(8)) AS DATE)) AS sales_month,
+	SUM(salestotal) AS total_monthly_sales
+FROM
+	dbo.factsalesorder
+GROUP BY
+	productkey,
+	DATE_PART('year', CAST(CAST(salesorderdatekey AS CHAR(8)) AS DATE)),
+	DATE_PART('month', CAST(CAST(salesorderdatekey AS CHAR(8)) AS DATE))
+ORDER BY
+	DATE_PART('year', CAST(CAST(salesorderdatekey AS CHAR(8)) AS DATE)),
+	DATE_PART('month', CAST(CAST(salesorderdatekey AS CHAR(8)) AS DATE))
+)
+SELECT
+	ms.productkey,
+	ms.sales_year,
+	ms.sales_month,
+	ms.total_monthly_sales,
+	LAG(ms.total_monthly_sales) OVER(PARTITION BY ms.productkey ORDER BY ms.sales_year, ms.sales_month) AS previous_monthly_sales,
+	(ms.total_monthly_sales - LAG(ms.total_monthly_sales) OVER(PARTITION BY ms.productkey ORDER BY ms.sales_year, ms.sales_month)) AS month_over_month_growth
+FROM
+	monthly_sales ms
+
+
+
+
+---- Average sales per weekday for each product category ----
+SELECT
+	p.category,
+	d.weekdayname,
+	ROUND(AVG(salestotal), 2) AS average_sales
+FROM
+	dbo.factsalesorder f
+JOIN
+	dbo.dimdate d
+	ON f.salesorderdatekey = d.datekey
+JOIN 
+	dbo.dimproduct p
+	ON f.productkey = p.productkey
+WHERE 
+	d.weekdayname NOT IN ('Saturday', 'Sunday')
+GROUP BY
+	p.category,
+	d.weekdayname
+ORDER BY
+	p.category,
+	d.weekdayname
+
+---- Percentage contribution of each product to total sales within its category ----
+WITH total_sales AS (
+SELECT
+	p.productkey,
+	p.category,
+	SUM(f.salestotal) AS  total_category_sales
+FROM
+	dbo.factsalesorder f
+JOIN
+	dbo.dimproduct p
+	ON f.productkey = p.productkey
+GROUP BY
+	p.productkey,
+	p.category
+ORDER BY
+	p.productkey
+)
+SELECT
+	ts.productkey,
+	ts.category,
+	ts.total_category_sales,
+	SUM(ts.total_category_sales) OVER (PARTITION BY ts.category) AS total_per_category,
+	ROUND(((ts.total_category_sales * 100)/ SUM(ts.total_category_sales) OVER (PARTITION BY ts.category)), 2) AS percentage_contribution
+FROM
+	total_sales ts
+
+
+----Customers who placed orders in at least 3 different years----
+SELECT
+	customerkey,
+	COUNT(DISTINCT DATE_PART('year', CAST(CAST(salesorderdatekey AS CHAR(8)) AS DATE))) AS orders_year
+FROM
+	dbo.factsalesorder
+GROUP BY
+	customerkey
+HAVING
+	COUNT(DISTINCT DATE_PART('year', CAST(CAST(salesorderdatekey AS CHAR(8)) AS DATE))) >= 3
+
+
+----Products that have a higher average sales total on weekends than weekdays.
+SELECT
+	f.productkey,
+	ROUND(AVG(CASE WHEN d.weekdayname IN ('Saturday', 'Sunday')
+			 THEN f.salestotal END), 2) AS average_weekend_sales,
+	ROUND(AVG(CASE WHEN d.weekdayname NOT IN ('Saturday', 'Sunday')
+			 THEN f.salestotal END), 2) AS average_weekday_sales
+FROM
+	dbo.factsalesorder f
+JOIN
+	dbo.dimdate d
+	ON f.salesorderdatekey = d.datekey
+GROUP BY
+	f.productkey
+HAVING
+	AVG(CASE WHEN d.weekdayname IN ('Saturday', 'Sunday')
+			 THEN f.salestotal END)
+			>
+	AVG(CASE WHEN d.weekdayname NOT IN ('Saturday', 'Sunday')
+			 THEN f.salestotal END) 
+
+
+---- Top-selling product per year using a correlated subquery ----
+WITH total_sales_per_product AS (
+SELECT
+	f.productkey,
+	DATE_PART('year', CAST(CAST(f.salesorderdatekey AS CHAR(8)) AS DATE)) AS orders_year,
+	SUM(f.salestotal) AS total_sales
+FROM
+	dbo.factsalesorder f
+GROUP BY
+	f.productkey,
+	DATE_PART('year', CAST(CAST(f.salesorderdatekey AS CHAR(8)) AS DATE))
+)
+SELECT
+	ts.productkey,
+	ts.orders_year,
+	ts.total_sales
+FROM
+	total_sales_per_product ts
+WHERE
+	ts.total_sales = (
+					SELECT MAX(sub.total_sales)
+					FROM total_sales_per_product sub
+					WHERE sub.orders_year = ts.orders_year
+					)
+ORDER BY
+	ts.orders_year,
+	ts.productkey
+
+
+
+---- Customers whose total sales dropped by more than 50% compared to the previous year----
+WITH total_yearly_sales AS (
+SELECT
+	customerkey,
+	DATE_PART('year', CAST(CAST(salesorderdatekey AS CHAR(8)) AS DATE)) AS sales_year,
+	SUM(salestotal) AS total_sales
+FROM
+	dbo.factsalesorder
+GROUP BY
+	customerkey,
+	DATE_PART('year', CAST(CAST(salesorderdatekey AS CHAR(8)) AS DATE))
+),
+lag_calculations AS(
+SELECT
+	tys.customerkey,
+	tys.sales_year,
+	tys.total_sales,
+	LAG(tys.total_sales) OVER( PARTITION BY tys.customerkey ORDER BY tys.sales_year) AS previous_year_sales_total,
+	ROUND(
+		(tys.total_sales - LAG(tys.total_sales) OVER( PARTITION BY tys.customerkey ORDER BY tys.sales_year)) / 
+		NULLIF(LAG(tys.total_sales) OVER( PARTITION BY tys.customerkey ORDER BY tys.sales_year), 0) * 100, 2) AS percentage_change
+FROM
+	total_yearly_sales tys
+)
+SELECT
+	l.customerkey,
+	l.sales_year,
+	l.total_sales,
+	l.previous_year_sales_total,
+	l.percentage_change
+FROM
+	lag_calculations l
+WHERE
+	l.previous_year_sales_total IS NOT NULL AND 
+	l.total_sales < (0.5 * l.previous_year_sales_total)
+ORDER BY
+	l.sales_year,
+	l.customerkey
+
+
+---Generate a pivot-style report showing total sales per month for each product category.
+SELECT
+	p.category,
+	SUM(f.salestotal) FILTER (WHERE DATE_PART('month', CAST(CAST(f.salesorderdatekey AS CHAR(8)) AS DATE)) = 1) AS jan_sales,
+	SUM(f.salestotal) FILTER (WHERE DATE_PART('month', CAST(CAST(f.salesorderdatekey AS CHAR(8)) AS DATE)) = 2) AS feb_sales,
+	SUM(f.salestotal) FILTER (WHERE DATE_PART('month', CAST(CAST(f.salesorderdatekey AS CHAR(8)) AS DATE)) = 3) AS mar_sales,
+	SUM(f.salestotal) FILTER (WHERE DATE_PART('month', CAST(CAST(f.salesorderdatekey AS CHAR(8)) AS DATE)) = 4) AS april_sales,
+	SUM(f.salestotal) FILTER (WHERE DATE_PART('month', CAST(CAST(f.salesorderdatekey AS CHAR(8)) AS DATE)) = 5) AS may_sales,
+	SUM(f.salestotal) FILTER (WHERE DATE_PART('month', CAST(CAST(f.salesorderdatekey AS CHAR(8)) AS DATE)) = 6) AS june_sales,
+	SUM(f.salestotal) FILTER (WHERE DATE_PART('month', CAST(CAST(f.salesorderdatekey AS CHAR(8)) AS DATE)) = 7) AS july_sales,
+	SUM(f.salestotal) FILTER (WHERE DATE_PART('month', CAST(CAST(f.salesorderdatekey AS CHAR(8)) AS DATE)) = 8) AS aug_sales,
+	SUM(f.salestotal) FILTER (WHERE DATE_PART('month', CAST(CAST(f.salesorderdatekey AS CHAR(8)) AS DATE)) = 9) AS sep_sales,
+	SUM(f.salestotal) FILTER (WHERE DATE_PART('month', CAST(CAST(f.salesorderdatekey AS CHAR(8)) AS DATE)) = 10) AS oct_sales,
+	SUM(f.salestotal) FILTER (WHERE DATE_PART('month', CAST(CAST(f.salesorderdatekey AS CHAR(8)) AS DATE)) = 11) AS nov_sales,
+	SUM(f.salestotal) FILTER (WHERE DATE_PART('month', CAST(CAST(f.salesorderdatekey AS CHAR(8)) AS DATE)) = 12) AS dec_sales
+FROM
+	dbo.factsalesorder f
+JOIN
+	dbo.dimproduct p
+	ON p.productkey = f.productkey
+GROUP BY
+	p.category
+ORDER BY
+	p.category
+
+
+---Optimize a query that joins all four tables and filters by year, category, and country.
+SELECT
+	p.category,
+	d."Year",
+	c.countryregion,
+	SUM(f.salestotal) AS total_sales
+FROM
+	dbo.factsalesorder f
+JOIN
+	dbo.dimproduct p
+	ON p.productkey = f.productkey
+JOIN
+	dbo.dimdate d
+	ON f.salesorderdatekey = d.datekey
+JOIN
+	dbo.dimcustomer c
+	ON c.customerkey = f.customerkey
+WHERE
+	p.category = 'Road Bikes' AND
+	d."Year" = 2022 OR
+	c.countryregion = 'Cananda'
+GROUP BY
+	p.category,
+	d."Year",
+	c.countryregion
+ORDER BY
+	total_sales
